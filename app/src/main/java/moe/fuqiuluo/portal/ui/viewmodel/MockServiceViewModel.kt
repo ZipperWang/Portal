@@ -29,6 +29,7 @@ class MockServiceViewModel : ViewModel() {
     lateinit var rocker: Rocker
     private lateinit var rockerJob: Job
     private lateinit var routeMockJob: Job
+    private var lastKnownRouteLocation: Pair<Double, Double>? = null
     var isRockerLocked = false
     var routeStage = 0
     val rockerCoroutineController = CoroutineController()
@@ -114,6 +115,7 @@ class MockServiceViewModel : ViewModel() {
                             Log.e("MockServiceViewModel", "Failed to set starting point for route mock")
                             continue
                         }
+                        recordRouteLocation(startPoint.first, startPoint.second)
                         routeStage++
                     }
 
@@ -126,14 +128,31 @@ class MockServiceViewModel : ViewModel() {
                         continue
                     }
 
-                    var currentLocation = MockServiceHelper.getLocation(locationManager!!)
-                    if (currentLocation == null) {
-                        Log.e("MockServiceViewModel", "Failed to obtain current location for route mock")
-                        continue
+                    val validatedCurrentLocation = validateRouteLocation(
+                        MockServiceHelper.getLocation(locationManager!!),
+                        distancePerTick
+                    )
+                    if (validatedCurrentLocation == null) {
+                        val fallback = lastKnownRouteLocation
+                        if (fallback == null) {
+                            Log.e(
+                                "MockServiceViewModel",
+                                "Unable to obtain a valid current location and no fallback is available"
+                            )
+                            continue
+                        }
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Using fallback route location $fallback because reported value is invalid"
+                        )
+                        recordRouteLocation(fallback.first, fallback.second)
                     }
 
-                    var currentLat = currentLocation.first
-                    var currentLon = currentLocation.second
+                    var currentLat = (validatedCurrentLocation ?: lastKnownRouteLocation)!!.first
+                    var currentLon = (validatedCurrentLocation ?: lastKnownRouteLocation)!!.second
+                    if (validatedCurrentLocation != null) {
+                        recordRouteLocation(currentLat, currentLon)
+                    }
 
                     // 处理所有已到达的阶段
                     while (routeStage < route.size) {
@@ -157,6 +176,7 @@ class MockServiceViewModel : ViewModel() {
                             }
                             currentLat = target.first
                             currentLon = target.second
+                            recordRouteLocation(currentLat, currentLon)
                             routeStage++
                         } else {
                             break
@@ -169,18 +189,35 @@ class MockServiceViewModel : ViewModel() {
                         rocker.autoStatus = false
                         // 重设阶段
                         routeStage = 0
+                        lastKnownRouteLocation = null
                         break // 退出循环
                     }
 
                     val target = route[routeStage]
-                    currentLocation = MockServiceHelper.getLocation(locationManager!!)
-                    if (currentLocation == null) {
-                        Log.e("MockServiceViewModel", "Failed to refresh location for route mock movement")
-                        continue
+                    val refreshedLocation = validateRouteLocation(
+                        MockServiceHelper.getLocation(locationManager!!),
+                        distancePerTick
+                    )
+                    if (refreshedLocation == null) {
+                        val fallback = lastKnownRouteLocation
+                        if (fallback == null) {
+                            Log.e(
+                                "MockServiceViewModel",
+                                "Unable to refresh route location and no fallback is available"
+                            )
+                            continue
+                        }
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Falling back to cached route location $fallback after invalid refresh"
+                        )
+                        currentLat = fallback.first
+                        currentLon = fallback.second
+                    } else {
+                        currentLat = refreshedLocation.first
+                        currentLon = refreshedLocation.second
+                        recordRouteLocation(currentLat, currentLon)
                     }
-
-                    currentLat = currentLocation.first
-                    currentLon = currentLocation.second
 
                     val inverse = Geodesic.WGS84.Inverse(
                         currentLat,
@@ -223,6 +260,7 @@ class MockServiceViewModel : ViewModel() {
                         Log.e("MockServiceViewModel", "更新路线位置失败")
                         continue
                     }
+                    recordRouteLocation(destination.lat2, destination.lon2)
 
                     if (!MockServiceHelper.setBearing(locationManager!!, azimuth)) {
                         Log.e("MockServiceViewModel", "更新方位角失败")
@@ -249,5 +287,32 @@ class MockServiceViewModel : ViewModel() {
         }
         val distance = FakeLoc.speed * (delayTime / 1000.0) / 0.85
         return if (distance.isFinite() && distance > 0.0) distance else 0.0
+    }
+
+    private fun validateRouteLocation(
+        reportedLocation: Pair<Double, Double>?,
+        distancePerTick: Double
+    ): Pair<Double, Double>? {
+        if (reportedLocation == null) {
+            return null
+        }
+        val (lat, lon) = reportedLocation
+        if (!lat.isFinite() || !lon.isFinite()) {
+            return null
+        }
+        if (lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+            return null
+        }
+        val previous = lastKnownRouteLocation ?: return reportedLocation
+        val delta = Geodesic.WGS84.Inverse(previous.first, previous.second, lat, lon).s12
+        val tolerance = (if (distancePerTick.isFinite() && distancePerTick > 0) distancePerTick else 0.0) * 5 + 5.0
+        return if (delta <= tolerance) reportedLocation else null
+    }
+
+    private fun recordRouteLocation(lat: Double, lon: Double) {
+        if (!lat.isFinite() || !lon.isFinite()) {
+            return
+        }
+        lastKnownRouteLocation = lat to lon
     }
 }
