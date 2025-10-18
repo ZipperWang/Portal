@@ -58,6 +58,15 @@ location.extras?.putBoolean("is_mock", true)
 - [x] **Portal** can set the accuracy in the settings.
 - [x] **Portal** will change the bearing when moving.
 
+## Applying the updated route mock behaviour
+
+1. Pull the latest `work` branch so that the route mock coroutine contains the geodesic stepping fix.
+2. Build a fresh APK with `./gradlew assembleDebug`.
+3. Install it on your test device using `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
+4. Launch **Portal**, open the **Route Mock** screen, pick a route with at least two waypoints, and start the mock; the marker will now walk between points instead of spinning because each tick advances along the geodesic path computed in `MockServiceViewModel`.
+
+If you changed the report interval or speed sliders, the helper method `calculateDistancePerTick` converts them into the actual travel distance per tick, so make sure both values are non-zero before you start the mock.
+
 # Thanks
 
 - [GoGoGo](https://github.com/ZCShou/GoGoGo)
