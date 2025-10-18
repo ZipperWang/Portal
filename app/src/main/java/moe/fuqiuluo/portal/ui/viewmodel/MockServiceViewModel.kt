@@ -23,11 +23,13 @@ import moe.fuqiuluo.portal.ui.mock.HistoricalRoute
 import moe.fuqiuluo.portal.ui.mock.Rocker
 import moe.fuqiuluo.xposed.utils.FakeLoc
 import net.sf.geographiclib.Geodesic
+import kotlin.math.min
 
 class MockServiceViewModel : ViewModel() {
     lateinit var rocker: Rocker
     private lateinit var rockerJob: Job
     private lateinit var routeMockJob: Job
+    private var lastKnownRouteLocation: Pair<Double, Double>? = null
     var isRockerLocked = false
     var routeStage = 0
     val rockerCoroutineController = CoroutineController()
@@ -60,8 +62,17 @@ class MockServiceViewModel : ViewModel() {
                     rockerCoroutineController.controlledCoroutine()
                     delay(delayTime)
 
+                    val distancePerTick = calculateDistancePerTick(delayTime)
+                    if (distancePerTick <= 0.0) {
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Skip rocker movement because calculated distance is $distancePerTick"
+                        )
+                        continue
+                    }
+
                     CrashReport.setUserSceneTag(applicationContext, 261773)
-                    if(!MockServiceHelper.move(locationManager!!, FakeLoc.speed / (1000 / delayTime) / 0.85, FakeLoc.bearing)) {
+                    if(!MockServiceHelper.move(locationManager!!, distancePerTick, FakeLoc.bearing)) {
                         Log.e("MockServiceViewModel", "Failed to move")
                     }
 
@@ -85,48 +96,88 @@ class MockServiceViewModel : ViewModel() {
                 do {
                     routeMockCoroutine.routeMockCoroutine()
                     delay(delayTime)
-                    // 如果是第0阶段，定位到第一个点
+
+                    val currentRoute = selectedRoute ?: continue
+                    val route = currentRoute.route
+                    if (route.isEmpty()) {
+                        Log.w("MockServiceViewModel", "Selected route has no waypoints, skip movement")
+                        continue
+                    }
+
                     if (routeStage == 0) {
-                        MockServiceHelper.setLocation(
-                            locationManager!!,
-                            selectedRoute!!.route[0].first,
-                            selectedRoute!!.route[0].second
-                        )
+                        val startPoint = route.first()
+                        if (!MockServiceHelper.setLocation(
+                                locationManager!!,
+                                startPoint.first,
+                                startPoint.second
+                            )
+                        ) {
+                            Log.e("MockServiceViewModel", "Failed to set starting point for route mock")
+                            continue
+                        }
+                        recordRouteLocation(startPoint.first, startPoint.second)
                         routeStage++
                     }
-                    val route = selectedRoute!!.route
+
+                    val distancePerTick = calculateDistancePerTick(delayTime)
+                    if (distancePerTick <= 0.0) {
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Skip route movement because calculated distance is $distancePerTick"
+                        )
+                        continue
+                    }
+
+                    val validatedCurrentLocation = validateRouteLocation(
+                        MockServiceHelper.getLocation(locationManager!!),
+                        distancePerTick
+                    )
+                    if (validatedCurrentLocation == null) {
+                        val fallback = lastKnownRouteLocation
+                        if (fallback == null) {
+                            Log.e(
+                                "MockServiceViewModel",
+                                "Unable to obtain a valid current location and no fallback is available"
+                            )
+                            continue
+                        }
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Using fallback route location $fallback because reported value is invalid"
+                        )
+                        recordRouteLocation(fallback.first, fallback.second)
+                    }
+
+                    var currentLat = (validatedCurrentLocation ?: lastKnownRouteLocation)!!.first
+                    var currentLon = (validatedCurrentLocation ?: lastKnownRouteLocation)!!.second
+                    if (validatedCurrentLocation != null) {
+                        recordRouteLocation(currentLat, currentLon)
+                    }
 
                     // 处理所有已到达的阶段
                     while (routeStage < route.size) {
                         val target = route[routeStage]
-                        val location = MockServiceHelper.getLocation(locationManager!!)
-                        val currentLat = location!!.first
-                        val currentLon = location.second
-
                         val inverse = Geodesic.WGS84.Inverse(
                             currentLat,
                             currentLon,
                             target.first,
                             target.second
                         )
-                        // 判断距离是否小于1米（可根据需要调整阈值）
-                        if (inverse.s12 < 1.0) {
-                            // 精确设置位置到目标点并进入下一阶段
-                            MockServiceHelper.setLocation(
-                                locationManager!!,
-                                target.first,
-                                target.second
-                            )
+                        val shouldSnap = inverse.s12 < 1.0 || inverse.s12 <= distancePerTick
+                        if (shouldSnap) {
+                            if (!MockServiceHelper.setLocation(
+                                    locationManager!!,
+                                    target.first,
+                                    target.second
+                                )
+                            ) {
+                                Log.e("MockServiceViewModel", "Failed to snap to route waypoint $routeStage")
+                                break
+                            }
+                            currentLat = target.first
+                            currentLon = target.second
+                            recordRouteLocation(currentLat, currentLon)
                             routeStage++
-                        } else if (inverse.s12 < FakeLoc.speed / (1000 / delayTime) / 0.85) {
-                            // 如果距离小于速度，直接移动到目标点
-                            MockServiceHelper.setLocation(
-                                locationManager!!,
-                                target.first,
-                                target.second
-                            )
-                            routeStage++
-
                         } else {
                             break
                         }
@@ -138,14 +189,35 @@ class MockServiceViewModel : ViewModel() {
                         rocker.autoStatus = false
                         // 重设阶段
                         routeStage = 0
+                        lastKnownRouteLocation = null
                         break // 退出循环
                     }
 
-                    // 处理当前目标点的移动
                     val target = route[routeStage]
-                    val location = MockServiceHelper.getLocation(locationManager!!)
-                    val currentLat = location!!.first
-                    val currentLon = location.second
+                    val refreshedLocation = validateRouteLocation(
+                        MockServiceHelper.getLocation(locationManager!!),
+                        distancePerTick
+                    )
+                    if (refreshedLocation == null) {
+                        val fallback = lastKnownRouteLocation
+                        if (fallback == null) {
+                            Log.e(
+                                "MockServiceViewModel",
+                                "Unable to refresh route location and no fallback is available"
+                            )
+                            continue
+                        }
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Falling back to cached route location $fallback after invalid refresh"
+                        )
+                        currentLat = fallback.first
+                        currentLon = fallback.second
+                    } else {
+                        currentLat = refreshedLocation.first
+                        currentLon = refreshedLocation.second
+                        recordRouteLocation(currentLat, currentLon)
+                    }
 
                     val inverse = Geodesic.WGS84.Inverse(
                         currentLat,
@@ -158,14 +230,43 @@ class MockServiceViewModel : ViewModel() {
                         azimuth += 360
                     }
 
-                    Log.d("MockServiceViewModel", "从 $currentLat, $currentLon 移动到 ${target.first}, ${target.second}, 方位角: $azimuth")
-                    if (!MockServiceHelper.move(
+                    val travelDistance = min(distancePerTick, inverse.s12)
+                    if (travelDistance <= 0.0 || !travelDistance.isFinite()) {
+                        Log.w(
+                            "MockServiceViewModel",
+                            "Calculated travel distance is invalid ($travelDistance), skip this tick"
+                        )
+                        continue
+                    }
+
+                    val destination = Geodesic.WGS84.Direct(
+                        currentLat,
+                        currentLon,
+                        azimuth,
+                        travelDistance
+                    )
+
+                    Log.d(
+                        "MockServiceViewModel",
+                        "从 $currentLat, $currentLon 移动到 ${destination.lat2}, ${destination.lon2}, 方位角: $azimuth, 距离: $travelDistance"
+                    )
+
+                    if (!MockServiceHelper.setLocation(
                             locationManager!!,
-                            FakeLoc.speed / (1000 / delayTime) / 0.85,
-                            azimuth
+                            destination.lat2,
+                            destination.lon2
                         )
                     ) {
-                        Log.e("MockServiceViewModel", "移动失败")
+                        Log.e("MockServiceViewModel", "更新路线位置失败")
+                        continue
+                    }
+                    recordRouteLocation(destination.lat2, destination.lon2)
+
+                    if (!MockServiceHelper.setBearing(locationManager!!, azimuth)) {
+                        Log.e("MockServiceViewModel", "更新方位角失败")
+                    } else {
+                        FakeLoc.bearing = azimuth
+                        FakeLoc.hasBearings = true
                     }
                 } while (isActive)
             }
@@ -178,5 +279,40 @@ class MockServiceViewModel : ViewModel() {
         return locationManager != null && MockServiceHelper.isServiceInit() && MockServiceHelper.isMockStart(
             locationManager!!
         )
+    }
+
+    private fun calculateDistancePerTick(delayTime: Long): Double {
+        if (delayTime <= 0) {
+            return 0.0
+        }
+        val distance = FakeLoc.speed * (delayTime / 1000.0) / 0.85
+        return if (distance.isFinite() && distance > 0.0) distance else 0.0
+    }
+
+    private fun validateRouteLocation(
+        reportedLocation: Pair<Double, Double>?,
+        distancePerTick: Double
+    ): Pair<Double, Double>? {
+        if (reportedLocation == null) {
+            return null
+        }
+        val (lat, lon) = reportedLocation
+        if (!lat.isFinite() || !lon.isFinite()) {
+            return null
+        }
+        if (lat !in -90.0..90.0 || lon !in -180.0..180.0) {
+            return null
+        }
+        val previous = lastKnownRouteLocation ?: return reportedLocation
+        val delta = Geodesic.WGS84.Inverse(previous.first, previous.second, lat, lon).s12
+        val tolerance = (if (distancePerTick.isFinite() && distancePerTick > 0) distancePerTick else 0.0) * 5 + 5.0
+        return if (delta <= tolerance) reportedLocation else null
+    }
+
+    private fun recordRouteLocation(lat: Double, lon: Double) {
+        if (!lat.isFinite() || !lon.isFinite()) {
+            return
+        }
+        lastKnownRouteLocation = lat to lon
     }
 }
